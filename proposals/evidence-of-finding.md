@@ -61,7 +61,8 @@ type AssistedRemediation struct {
 
 Survey of the rule library
 ([`regolibrary/rules/`](https://github.com/kubescape/regolibrary/tree/main/rules),
-**275 rules total**, classified by scanning every `raw.rego`):
+**275 classified rules** from the original survey; `master` has ~278
+`rules/*/raw.rego` files as of 2026-07-21):
 
 | `failedPaths` classification | Rule count |
 |---|---|
@@ -70,11 +71,11 @@ Survey of the rule library
 | Always emits `failedPaths: []` placeholder | **102** |
 | Does not emit `failedPaths` at all | **7** |
 
-Of the 109 rules with no real `failedPaths`, **35** still emit real
+Of the 109 classified rules with no real `failedPaths`, **35** still emit real
 `reviewPaths`, `fixPaths`, or `deletePaths`. So the actual coverage picture is:
 
-- **201 / 275 rules** emit at least one real evidence path somewhere.
-- **74 / 275 rules** emit no path-level evidence at all — these are
+- **201 / 275 classified rules** emit at least one real evidence path somewhere.
+- **74 / 275 classified rules** emit no path-level evidence at all — these are
   predominantly multi-resource cluster-config and RBAC controls where the
   triggering condition is a relationship across several objects.
 
@@ -131,14 +132,14 @@ parallel implementations that drift.
   direct codebase history backing the no-line-faking constraint for
   Helm/Kustomize.
 
-**Open — hard prerequisite:**
+**Merged — correctness fix:**
 
 - [kubescape #2311](https://github.com/kubescape/kubescape/pull/2311) —
-  fixes a pre-seed bug where `ResourceAssociatedRule.Paths` for
+  merged on 2026-05-26 and fixes a pre-seed bug where
+  `ResourceAssociatedRule.Paths` for
   cluster-scoped resources (e.g. ClusterRoles) get clobbered across
-  namespace iterations in large-cluster mode. Without it, evidence for
-  cluster-scoped resources shows only the last namespace's paths. Phase 1
-  declares this as a dependency.
+  namespace iterations in large-cluster mode. The evidence implementation
+  should build on that fix; no extra prerequisite is needed for this issue.
 
 **Printer / `--verbose` precedent:**
 
@@ -209,8 +210,9 @@ type Source struct {
     // Empty for non-cluster scans.
     KubectlCommand string `json:"kubectlCommand,omitempty"`
 
-    // RawYamlLines maps a JSON-path string (as emitted by rego in
-    // FailedPaths/ReviewPaths/etc.) to the 1-indexed line number in File.
+    // RawYamlLines maps the canonical form of a JSON-path string (as emitted
+    // by rego in FailedPaths/ReviewPaths/etc.) to the 1-indexed line number in
+    // File.
     // Populated only for SourceTypeYaml. Missing entries mean "unknown line";
     // we never guess. Backed by a yaml.v3 Node tree captured at parse time.
     RawYamlLines map[string]int `json:"rawYamlLines,omitempty"`
@@ -226,11 +228,12 @@ This avoids:
 - Backwards-incompatibility on the JSON report schema.
 - Re-implementing fields that #2083 / opa-utils#168 already shipped.
 
-Redaction is a *renderer* concern, not a schema concern: when the rule's
-metadata tags include `sensitive-data` (or the rule ID is on the redaction
-allowlist defined in 5.4), the renderer substitutes `"<redacted>"` for the
-resolved value before printing. The on-disk JSON report retains the literal
-value behind `--show-secrets`; default JSON output also redacts.
+Redaction is a report-serialization concern, not only a pretty-printer
+concern: when the rule's metadata tags include `sensitive-data` (or the rule ID
+is on the redaction allowlist defined in 5.4), the output sanitizer substitutes
+`"<redacted>"` for the resolved evidence value and also scrubs the embedded raw
+objects that would otherwise carry the same literal value. `--show-secrets`
+disables that sanitizer for users who explicitly need literal values.
 
 ### 5.2 Path resolver
 
@@ -241,11 +244,18 @@ rego doesn't generate them.
 **Reuse, don't reinvent:** [#2281](https://github.com/kubescape/kubescape/pull/2281)
 already added segment-aware YAML path helpers (`yamlPathCovers`,
 `plannedPathsFromExpressions`) in `core/pkg/fixhandler/fixhandler.go`. The
-splitter / segmenter must be **lifted into a shared package** (e.g.
-`opa-utils/reporthandling/pathutil`) so both the fixhandler and the new
-resolver share one definition of "path segment." Independent implementations
-will drift and produce conflicting answers (e.g. `spec.host` vs
-`spec.hostNetwork`) — exactly the bug class #2281 fixed.
+splitter / segmenter and canonicalizer must be **lifted into a shared package**
+(e.g. `opa-utils/reporthandling/pathutil`) so the fixhandler, evidence
+resolver, and YAML node walker share one definition of "path segment."
+Independent implementations will drift and produce conflicting answers (e.g.
+`spec.host` vs `spec.hostNetwork`) — exactly the bug class #2281 fixed.
+
+The resolver does not compare raw path strings directly. Every rego-emitted path
+and every key produced by the yaml.v3 node walk is parsed through `pathutil` and
+serialized back to one canonical key before lookup. The original rule-emitted
+path is still preserved for display, but `RawYamlLines` is keyed only by the
+canonical form. Phase 1 owns this canonicalization contract so phase 2 does not
+have to reverse-engineer multiple path dialects independently.
 
 Behavior contract:
 
@@ -260,9 +270,9 @@ Done by the resource handler at scan time, not by re-reading files later
 (the file may have changed between scan and report).
 
 - **Raw YAML files:** parse with `gopkg.in/yaml.v3` to get a Node tree;
-  walk it to populate `Source.RawYamlLines` keyed by the JSON-path strings
-  the resolver will look up. Done once at parse time; Node tree discarded
-  afterwards.
+  walk it to populate `Source.RawYamlLines` keyed by the canonical JSON-path
+  strings the resolver will look up. Done once at parse time; Node tree
+  discarded afterward.
 - **Helm:** **already done** by [#2083](https://github.com/kubescape/kubescape/pull/2083) +
   [opa-utils#168](https://github.com/kubescape/opa-utils/pull/168).
   `Source.HelmTemplateFile` and `Source.HelmValuesPaths` are populated by
@@ -275,17 +285,19 @@ Done by the resource handler at scan time, not by re-reading files later
   [#1628](https://github.com/kubescape/kubescape/pull/1628))
   was abandoned and the dead remnants cleaned up in
   [#1995](https://github.com/kubescape/kubescape/pull/1995).
-- **Kustomize:** capture source file from the build annotation. No line.
+- **Kustomize:** capture source file from `config.kubernetes.io/origin` when
+  the rendered resource carries that annotation. This is best-effort: Kustomize
+  only emits the annotation when origin annotations are enabled in
+  `buildMetadata`, so the renderer must omit source rather than guess when the
+  annotation is absent. No line.
 - **Cluster:** populate `Source.KubectlCommand` from the resource's GVK +
   name + namespace + the path. No `File`/`Line`.
 - **Git/repo scans:** same as raw YAML.
 
 Note: reliable evidence on cluster-scoped resources (e.g. ClusterRole) in
-large-cluster mode depends on
-[#2311](https://github.com/kubescape/kubescape/pull/2311) landing, which
-fixes a pre-seed bug where `Paths` were clobbered across namespace
-iterations. Phase 1 should declare this PR as a prerequisite or include a
-defensive merge in the resolver.
+large-cluster mode assumes the merged
+[#2311](https://github.com/kubescape/kubescape/pull/2311) fix is present. No
+additional defensive merge is planned for the evidence resolver.
 
 ### 5.4 Redaction policy
 
@@ -297,22 +309,32 @@ are sensitive by default. Initially:
 - `alert-mount-potential-credentials-paths`
 - Anything whose metadata tags include `sensitive-data`.
 
-For these, the renderer substitutes the resolved value with `"<redacted>"`
-before printing or serializing. A new CLI flag `--show-secrets` (default off)
-disables redaction. The flag's help text spells out the risk: *"Includes
-literal credential values in output; do not share resulting reports."*
+For these, the output sanitizer substitutes the resolved value with
+`"<redacted>"` before printing or serializing and also scrubs the same path in
+all embedded raw objects that can be serialized into reports:
+
+- `RuleResponse.AlertObject.K8SApiObjects`
+- `RuleResponse.RelatedObjects[*].Object`
+- `PostureReport.Resources[*].Object` when raw resources are included
+
+If a sensitive path cannot be resolved in an embedded object, the sanitizer
+drops that embedded object from default serialized outputs rather than shipping
+raw credentials. A new CLI flag `--show-secrets` (default off) disables
+redaction. The flag's help text spells out the risk: *"Includes literal
+credential values in output; do not share resulting reports."*
 
 ### 5.5 CLI surface
 
 - New flag: `--show-evidence` (alias `-E`) on `scan`, defaulting **off**.
   When on, the pretty printer renders an evidence block under each failed
   (resource, control) pair.
-- `--verbose` / `-v` is left alone (compatibility). `-vv` enables
-  `--show-evidence` implicitly.
-- `--show-secrets` is independent; requires `--show-evidence` to have any
-  effect.
+- `--verbose` / `-v` is left alone (compatibility). The current Kubescape CLI
+  binds `-v` as a boolean, not a count, so `-vv` is not part of the initial
+  surface; supporting it later would require explicit shorthand-count parsing.
+- `--show-secrets` is independent from `--show-evidence`; it controls whether
+  evidence-capable outputs keep or sanitize sensitive literal values.
 - JSON / SARIF / HTML / JUnit always serialize the underlying path +
-  resolved-value data (redacted by default) — these consumers are
+  resolved-value data after the redaction sanitizer runs — these consumers are
   programmatic and can choose to display or not. `--verbose` precedent for
   scan output and image scans is set by [#1320](https://github.com/kubescape/kubescape/pull/1320)
   and [#1932](https://github.com/kubescape/kubescape/pull/1932).
@@ -358,9 +380,9 @@ Each phase ships standalone value and is independently mergeable.
 
 | Phase | Scope | Risk |
 |---|---|---|
-| **1** | Lift segmenter from [#2281](https://github.com/kubescape/kubescape/pull/2281) into a shared `pathutil` package; build path resolver on top; pretty-printer block; `--show-evidence` flag; cluster-scan `Source.KubectlCommand` extension; fallback renderer for the 74 no-path rules. | Low — additive, no existing output changes when flag is off. Depends on [#2311](https://github.com/kubescape/kubescape/pull/2311) for reliable cluster-scoped resource evidence. |
-| **2** | Raw-YAML file:line capture via yaml.v3 Node tree; populate `Source.RawYamlLines`. | Medium — touches scan-time code in the resource handler. |
-| **3** | Default redaction + `--show-secrets`; JSON/SARIF/HTML/JUnit emitters. | Low — mechanical once data flow is in. |
+| **1** | Lift segmenter/canonicalizer from [#2281](https://github.com/kubescape/kubescape/pull/2281) into a shared `pathutil` package; build path resolver on top; pretty-printer block; `--show-evidence` flag; cluster-scan `Source.KubectlCommand` extension; fallback renderer for the 74 no-path rules. | Medium — additive when the flag is off, but correctness depends on one shared canonical path representation. |
+| **2** | Raw-YAML file:line capture via yaml.v3 Node tree; populate `Source.RawYamlLines` with canonical keys generated by `pathutil`. | Medium-high — touches scan-time code in the resource handler and must round-trip rego path variants to node-walk keys. |
+| **3** | Default redaction + `--show-secrets`; JSON/SARIF/HTML/JUnit emitters; scrub or omit embedded raw objects for sensitive findings. | Medium — must prove default serialized reports do not retain secret literals in `AlertObject`, `RelatedObjects`, or raw resource objects. |
 | **4** | Wire existing `Source.HelmTemplateFile` / `HelmValuesPaths` (already populated by [#2083](https://github.com/kubescape/kubescape/pull/2083)) into the evidence renderer. Add Kustomize source-file capture. | Low for Helm (data is there); Medium for Kustomize (new). |
 | **5** | regolibrary cleanup: convert the 74 no-path rules (and 17 mixed ones) to emit real paths or structured evidence fields. Continues the path-richness work begun in [#1402](https://github.com/kubescape/kubescape/pull/1402) / [opa-utils#139](https://github.com/kubescape/opa-utils/pull/139). | Long-tail, per-rule PRs. |
 | **6** | kubevuln image-scan evidence (CVE + package + version + SBOM layer). Extends the verbose image-scan printer pattern from [#1320](https://github.com/kubescape/kubescape/pull/1320) / [#1932](https://github.com/kubescape/kubescape/pull/1932). | Separate repo, separate design doc. |
@@ -376,8 +398,9 @@ correctness bar above normal CLI output. The implementation MUST:
 1. Never silently drop a path it cannot resolve — always render
    `value: <unresolved>` so the user knows.
 2. Never invent a source line. If line is unknown, omit it; do not guess.
-3. Never include a redacted value in default output. Redaction is the
-   default, opt-out is explicit.
+3. Never include an unredacted sensitive value anywhere in default output.
+   Redaction is the default, opt-out is explicit, and embedded raw objects must
+   be scrubbed or omitted when they would otherwise carry the sensitive literal.
 4. Be deterministic: the same scan against the same input must produce
    byte-identical evidence blocks across runs.
 5. Have golden-file tests for every rendering mode (pretty, JSON, SARIF,
@@ -387,8 +410,10 @@ correctness bar above normal CLI output. The implementation MUST:
 
 ## 8. Open questions
 
-- **Naming:** `--show-evidence` vs `--evidence` vs reusing `-vv`?
-  Recommendation: `--show-evidence` as primary, `-vv` as convenience alias.
+- **Naming:** `--show-evidence` vs `--evidence`?
+  Recommendation: `--show-evidence` as primary with `-E` shorthand. Reusing
+  `-vv` is deferred unless Kubescape changes verbosity from a boolean into an
+  explicit count or pre-parsed shorthand.
 - **HTML report layout:** does the existing HTML template have room for a
   per-finding evidence panel, or does it need a redesign? Needs spike.
 - **Multi-source resources:** a Deployment defined in raw YAML but applied
@@ -408,7 +433,7 @@ correctness bar above normal CLI output. The implementation MUST:
   already the source of truth for downstream tooling, but the issue is
   specifically about humans reading CLI output during triage. Asking an
   auditor to `jq` through a 50MB JSON file is not a fix.
-- **Per-rule custom evidence handlers in Go.** Rejected: 275 rules,
+- **Per-rule custom evidence handlers in Go.** Rejected: 275 classified rules,
   maintenance burden, and most rules can be served by the generic
   path-resolver. Custom handling is reserved for the placeholder-path
   cluster-config rules in phase 5.
