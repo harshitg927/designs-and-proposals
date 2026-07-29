@@ -162,9 +162,9 @@ parallel implementations that drift.
   for cluster scans.
 - Surface evidence consistently across **pretty**, **JSON**, **SARIF**, **HTML**,
   and **JUnit** output formats.
-- Default-redact values for any path the rule itself flags as sensitive
-  (credentials, tokens, env values matched as secrets). Opt-in `--show-secrets`
-  to reveal.
+- Default-redact resolved values for rules that match credentials via the
+  existing `sensitiveValues` / `sensitiveKeyNames` posture control inputs
+  (§5.4). Opt-in `--show-secrets` to reveal.
 - Be honest about uncertainty: if a path cannot be resolved, say so explicitly
   rather than silently dropping it.
 
@@ -229,11 +229,12 @@ This avoids:
 - Re-implementing fields that #2083 / opa-utils#168 already shipped.
 
 Redaction is a report-serialization concern, not only a pretty-printer
-concern: when the rule's metadata tags include `sensitive-data` (or the rule ID
-is on the redaction allowlist defined in 5.4), the output sanitizer substitutes
-`"<redacted>"` for the resolved evidence value and also scrubs the embedded raw
-objects that would otherwise carry the same literal value. `--show-secrets`
-disables that sanitizer for users who explicitly need literal values.
+concern: when a rule is classified sensitive by the predicate in §5.4, the
+output sanitizer substitutes `"<redacted>"` for the resolved evidence value and
+also scrubs the embedded raw objects that would otherwise carry the same literal
+value. `--show-secrets` disables that sanitizer for users who explicitly need
+literal values. The value-level substitution ships in phase 1 alongside the
+pretty printer; embedded-object scrubbing follows in phase 3 (§6).
 
 ### 5.2 Path resolver
 
@@ -301,17 +302,69 @@ additional defensive merge is planned for the evidence resolver.
 
 ### 5.4 Redaction policy
 
-A small allowlist in `opa-utils` of rule categories whose evidence values
-are sensitive by default. Initially:
+**Which rules are sensitive — decided from data that already exists.**
 
-- `rule-credentials-in-env-var` (C-0012)
-- `rule-credentials-configmap`
-- `alert-mount-potential-credentials-paths`
-- Anything whose metadata tags include `sensitive-data`.
+An earlier draft of this section keyed redaction off a `sensitive-data` entry in
+rule metadata tags. That field does not exist: `rule.metadata.json` has no
+`tags` key at all (the schema is `name` / `attributes` / `ruleLanguage` /
+`match` / `configInputs` / `controlConfigInputs` / `ruleDependencies` /
+`description` / `remediation` / `ruleQuery`), and the string `sensitive-data`
+appears nowhere under `regolibrary/rules/` on `master`. A tag-based predicate
+therefore selects nothing today, and inventing the tag would make this proposal
+depend on a rule-library schema change — the same class of change §8 explicitly
+defers.
 
-For these, the output sanitizer substitutes the resolved value with
-`"<redacted>"` before printing or serializing and also scrubs the same path in
-all embedded raw objects that can be serialized into reports:
+**Decision: key the policy off the control inputs that already exist.** A rule
+is treated as credential-bearing when its `controlConfigInputs` reference
+either of the credential-matching posture control inputs:
+
+- `settings.postureControlInputs.sensitiveValues`
+- `settings.postureControlInputs.sensitiveKeyNames`
+
+(together with their `sensitiveValuesAllowed` / `sensitiveKeyNamesAllowed`
+allowlists, which the same rules consume to suppress known-safe matches).
+
+This makes the policy data-driven and self-maintaining: any future rule that
+matches credentials via these inputs is redacted automatically, with no Go-side
+list to update. Kubescape already loads `rule.metadata.json` as part of the
+downloaded policy, so the predicate is evaluable at scan time with no new I/O.
+
+On `regolibrary` `master` the predicate resolves to exactly two rules:
+
+| Rule | Control inputs consumed | Redacted? |
+|---|---|---|
+| `rule-credentials-in-env-var` (C-0012) | `sensitiveValues`, `sensitiveKeyNames` (+ both allowlists) | **yes** |
+| `rule-credentials-configmap` | `sensitiveValues`, `sensitiveKeyNames` (+ both allowlists) | **yes** |
+
+Two rules are deliberately **not** covered, and the reasons are worth recording
+so they are not re-added later:
+
+- `exposed-sensitive-interfaces-v1` is the third rule under `rules/` that
+  references a `postureControlInputs.sensitive*` input, but the input it
+  consumes is
+  [`sensitiveInterfaces`](https://github.com/kubescape/regolibrary/blob/master/default-config-inputs.json)
+  — a list of *workload name substrings* (`nifi`, `argo-server`, `kubeflow`,
+  `kubernetes-dashboard`, `jenkins`, `prometheus-deployment`, `weave-scope-app`).
+  Its evidence is a workload name and the LoadBalancer address that exposes it,
+  not credential material. Redacting it would delete the finding's only useful
+  content. Hence the predicate keys on `sensitiveValues`/`sensitiveKeyNames`
+  specifically, not on the `sensitive*` prefix.
+- `alert-mount-potential-credentials-paths` was on the earlier hardcoded list
+  and is dropped. It declares no `controlConfigInputs` at all (and an empty
+  `attributes` object), and its evidence is a `hostPath` mount path — the path
+  *is* the finding. Redacting it removes the only actionable part.
+
+The residual gap is a rule that surfaces credential material without consuming
+either control input. Nothing under `rules/` does this today. Closing that gap
+properly needs a first-class sensitivity marker in the rule schema, which is
+the same regolibrary schema change §8 defers to phase 5; until it lands, the
+control-input predicate is the whole policy and this document does not pretend
+otherwise.
+
+**What the sanitizer does.** For a rule matching the predicate, the output
+sanitizer substitutes the resolved value with `"<redacted>"` before printing or
+serializing, and also scrubs the same path in all embedded raw objects that can
+be serialized into reports:
 
 - `RuleResponse.AlertObject.K8SApiObjects`
 - `RuleResponse.RelatedObjects[*].Object`
@@ -319,9 +372,54 @@ all embedded raw objects that can be serialized into reports:
 
 If a sensitive path cannot be resolved in an embedded object, the sanitizer
 drops that embedded object from default serialized outputs rather than shipping
-raw credentials. A new CLI flag `--show-secrets` (default off) disables
-redaction. The flag's help text spells out the risk: *"Includes literal
-credential values in output; do not share resulting reports."*
+raw credentials — except on the submit path, where omission is not available
+and the fallback is a conservative scrub of the value-bearing subtree instead
+(§5.4.1). A new CLI flag `--show-secrets` (default off) disables redaction. The
+flag's help text spells out the risk: *"Includes literal credential values in
+output; do not share resulting reports."*
+
+The two halves ship in different phases: value-level substitution in the
+evidence renderer lands in phase 1 with `--show-evidence`, embedded-object
+scrubbing in phase 3 with the serialized emitters (§6).
+
+### 5.4.1 Composition with the existing report-sanitization flags
+
+Kubescape already ships three mechanisms for making a report safe to share, and
+this proposal adds a fourth. Left undocumented, that is four partially
+overlapping switches with undefined interactions. The intended composition:
+
+| Existing mechanism | What it does today | Interaction with evidence redaction |
+|---|---|---|
+| `--omit-raw-resources` ([`printer/v2/utils.go` L217](https://github.com/kubescape/kubescape/blob/master/core/pkg/resultshandling/printer/v2/utils.go#L217): `if !data.OmitRawResources { report.Resources = finalizeResources(...) }`) | Drops `PostureReport.Resources` from serialized output entirely | Strictly stronger than the third scrub target above. When set, evidence redaction skips that target — the payload is already gone. It does **not** cover `AlertObject` / `RelatedObjects`, which the evidence sanitizer still scrubs. |
+| `--hide` ([`scan.go` L184](https://github.com/kubescape/kubescape/blob/master/cmd/scan/scan.go#L184)) — "Replace sensitive report metadata with deterministic pseudonyms", applied via [`anonymizer.Apply`](https://github.com/kubescape/kubescape/blob/master/core/pkg/anonymizer/anonymizer.go#L10) | Rewrites resource names, namespaces, annotations, `sourcePath`, image references and container env values in the **session**, before results handling | Runs earlier in the pipeline than the evidence sanitizer, so the renderer sees already-pseudonymized data. `--hide` does not imply evidence redaction and evidence redaction does not imply `--hide`: they are orthogonal and both apply. Consequence to document in the flag help: under `--hide`, evidence `source:` lines and resolved values are pseudonyms, not literals. |
+| `--encrypt` ([`scan.go` L185](https://github.com/kubescape/kubescape/blob/master/cmd/scan/scan.go#L185), [`core/pkg/reportcrypto`](https://github.com/kubescape/kubescape/blob/master/core/pkg/reportcrypto/crypto.go)) — same transformer pipeline via [`anonymizer.ApplyEncrypted`](https://github.com/kubescape/kubescape/blob/master/core/pkg/anonymizer/anonymizer.go#L44), reversible with `KUBESCAPE_MASTER_KEY` | Encrypts the same field set instead of pseudonymizing it; mutually exclusive with `--hide` ([`core/core/scan.go` L307/L343](https://github.com/kubescape/kubescape/blob/master/core/core/scan.go#L307)) | Same ordering as `--hide`. Because encryption is reversible and redaction is not, `--encrypt` must **not** be treated as satisfying the §7 bar: a `<redacted>` evidence value stays `<redacted>` after `kubescape decrypt`. |
+| `--show-secrets` (new) | Disables evidence redaction | Overrides nothing else. It re-enables literal values in evidence but cannot resurrect payload dropped by `--omit-raw-resources`, nor un-pseudonymize `--hide` output. |
+
+Note the overlap on the `--hide` row is not merely conceptual: the anonymizer
+already carries its own hardcoded credential heuristics,
+[`isSensitiveEnvName`](https://github.com/kubescape/kubescape/blob/master/core/pkg/anonymizer/container.go#L505)
+and
+[`isSensitiveEnvValue`](https://github.com/kubescape/kubescape/blob/master/core/pkg/anonymizer/container.go#L482),
+whose pattern lists resemble but do not match `sensitiveKeyNames` /
+`sensitiveValues` (e.g. the anonymizer knows `dsn` and `connectionstring`; the
+control inputs know `eyJhbGciO` and `BEGIN \w+ PRIVATE KEY`). Phase 3 should
+either converge the two on the control inputs or state explicitly why they stay
+separate — shipping a third divergent credential-pattern list is the outcome to
+avoid.
+
+**Sharp edge: submitted reports.** `--omit-raw-resources` cannot be the
+mechanism for submitted reports. It is rejected together with `--submit`
+([`ErrOmitRawResourcesOrSubmit`](https://github.com/kubescape/kubescape/blob/master/cmd/scan/framework.go#L47),
+enforced in [`cmd/scan/framework.go` L259](https://github.com/kubescape/kubescape/blob/master/cmd/scan/framework.go#L259)
+and [`cmd/scan/control.go` L138](https://github.com/kubescape/kubescape/blob/master/cmd/scan/control.go#L138)),
+and in submit mode it is explicitly ignored with a warning
+([`core/core/scan.go` L67](https://github.com/kubescape/kubescape/blob/master/core/core/scan.go#L67):
+`"omit-raw-resources flag will be ignored in submit mode"`). So for submitted
+reports the raw objects always travel to the backend. Redaction there must be
+value-level scrubbing applied to the object itself **before** submission, not
+omission. This is the case where a leaked credential travels furthest, and
+phase 3's acceptance criteria must include a submit-path test, not only a
+serialized-file test.
 
 ### 5.5 CLI surface
 
@@ -380,15 +478,34 @@ Each phase ships standalone value and is independently mergeable.
 
 | Phase | Scope | Risk |
 |---|---|---|
-| **1** | Lift segmenter/canonicalizer from [#2281](https://github.com/kubescape/kubescape/pull/2281) into a shared `pathutil` package; build path resolver on top; pretty-printer block; `--show-evidence` flag; cluster-scan `Source.KubectlCommand` extension; fallback renderer for the 74 no-path rules. | Medium — additive when the flag is off, but correctness depends on one shared canonical path representation. |
+| **1** | Lift segmenter/canonicalizer from [#2281](https://github.com/kubescape/kubescape/pull/2281) into a shared `pathutil` package; build path resolver on top; pretty-printer block; `--show-evidence` flag; **value-level redaction for the §5.4 rule predicate plus `--show-secrets`**; cluster-scan `Source.KubectlCommand` extension; fallback renderer for the 74 no-path rules. | Medium — additive when the flag is off, but correctness depends on one shared canonical path representation. |
 | **2** | Raw-YAML file:line capture via yaml.v3 Node tree; populate `Source.RawYamlLines` with canonical keys generated by `pathutil`. | Medium-high — touches scan-time code in the resource handler and must round-trip rego path variants to node-walk keys. |
-| **3** | Default redaction + `--show-secrets`; JSON/SARIF/HTML/JUnit emitters; scrub or omit embedded raw objects for sensitive findings. | Medium — must prove default serialized reports do not retain secret literals in `AlertObject`, `RelatedObjects`, or raw resource objects. |
+| **3** | Extend the phase-1 sanitizer to serialized output: JSON/SARIF/HTML/JUnit emitters; scrub embedded raw objects (`AlertObject`, `RelatedObjects`, `PostureReport.Resources`) including on the submit path; document composition with `--omit-raw-resources` / `--hide` / `--encrypt` per §5.4.1. | Medium — must prove default serialized *and submitted* reports do not retain secret literals in `AlertObject`, `RelatedObjects`, or raw resource objects. |
 | **4** | Wire existing `Source.HelmTemplateFile` / `HelmValuesPaths` (already populated by [#2083](https://github.com/kubescape/kubescape/pull/2083)) into the evidence renderer. Add Kustomize source-file capture. | Low for Helm (data is there); Medium for Kustomize (new). |
 | **5** | regolibrary cleanup: convert the 74 no-path rules (and 17 mixed ones) to emit real paths or structured evidence fields. Continues the path-richness work begun in [#1402](https://github.com/kubescape/kubescape/pull/1402) / [opa-utils#139](https://github.com/kubescape/opa-utils/pull/139). | Long-tail, per-rule PRs. |
 | **6** | kubevuln image-scan evidence (CVE + package + version + SBOM layer). Extends the verbose image-scan printer pattern from [#1320](https://github.com/kubescape/kubescape/pull/1320) / [#1932](https://github.com/kubescape/kubescape/pull/1932). | Separate repo, separate design doc. |
 
 A user gets useful evidence the moment phase 1 lands; every subsequent
 phase widens coverage without changing the surface.
+
+**Why redaction is split across phases 1 and 3.** Because each phase is
+independently mergeable, a phase-1-only release must already satisfy §7 bar #3.
+An earlier draft put all redaction in phase 3, which meant phase 1 would print
+the literal env-var value for a C-0012 finding with no sanitizer in front of it
+— a shippable release violating the document's own reliability bar. The split
+above is drawn along the surface each phase actually exposes:
+
+- **Phase 1** exposes exactly one surface, the pretty-printer evidence block
+  behind `--show-evidence`. It therefore needs exactly one thing: the
+  value-level `"<redacted>"` substitution for rules matching the §5.4
+  predicate, plus `--show-secrets` to opt out. That is a small, self-contained
+  sanitizer sitting between the path resolver and the renderer.
+- **Phase 3** extends that same sanitizer to the serialized formats and to the
+  embedded raw objects. Phase 1 does not touch serialized output, so deferring
+  the embedded-object scrubbing leaks nothing.
+
+Concretely, `--show-secrets` is introduced in phase 1 rather than phase 3; the
+flag's scope widens in phase 3 but its default and semantics do not change.
 
 ## 7. Reliability bar
 
@@ -401,12 +518,19 @@ correctness bar above normal CLI output. The implementation MUST:
 3. Never include an unredacted sensitive value anywhere in default output.
    Redaction is the default, opt-out is explicit, and embedded raw objects must
    be scrubbed or omitted when they would otherwise carry the sensitive literal.
+   This bar binds **per phase**, not only at the end of the sequence: no phase
+   may ship an output surface without the sanitizer that covers it (§6).
+   For submitted reports, "scrubbed or omitted" collapses to *scrubbed* —
+   omission is unavailable on that path (§5.4.1).
 4. Be deterministic: the same scan against the same input must produce
    byte-identical evidence blocks across runs.
 5. Have golden-file tests for every rendering mode (pretty, JSON, SARIF,
    HTML, JUnit) covering: resolvable path, unresolvable path, redacted
    value, multi-path finding, placeholder-path fallback, cluster source,
-   helm source, raw-yaml source with line.
+   helm source, raw-yaml source with line — plus one case per flag
+   interaction in §5.4.1 (`--omit-raw-resources`, `--hide`, `--encrypt`,
+   `--show-secrets`) and a submit-path case asserting no credential literal
+   survives in the submitted payload.
 
 ## 8. Open questions
 
@@ -426,6 +550,15 @@ correctness bar above normal CLI output. The implementation MUST:
   rule response schema so phase-5 rules can emit structured evidence
   (e.g. matched substring + offset) rather than just paths? Probably yes,
   but defer the schema change until phase 5 is scoped.
+- **Rule-level sensitivity marker:** the same phase-5 schema change is the
+  natural home for an explicit per-rule sensitivity flag, which would replace
+  the control-input predicate in §5.4 with a direct declaration and close the
+  residual gap for rules that surface credentials without consuming
+  `sensitiveValues` / `sensitiveKeyNames`. No such rule exists under `rules/`
+  today, so this is a robustness improvement rather than a live gap — and it is
+  deliberately *not* a prerequisite for phases 1–3. Recorded here so the
+  control-input predicate is understood as the current whole policy, not as a
+  stopgap for a field that already exists.
 
 ## 9. Alternatives considered
 
